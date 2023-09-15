@@ -7,7 +7,11 @@ from comet_llm import Span, end_chain, start_chain
 
 load_dotenv()
 
+# You need to set your OpenAI and Comet API keys in a .env file.
 openai.api_key = os.getenv("OPENAI_API_KEY")
+COMET_API_KEY = os.getenv("COMET_API_KEY")
+
+
 MODEL = "gpt-3.5-turbo-0613"
 
 history = {}
@@ -176,7 +180,7 @@ start_chain(
     inputs={
         "prompt": SYSTEM_PROMPT,
     },
-    api_key=os.getenv("COMET_API_KEY"),
+    api_key=COMET_API_KEY,
 )
 
 
