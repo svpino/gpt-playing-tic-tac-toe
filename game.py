@@ -3,10 +3,12 @@ import openai
 import json
 
 from dotenv import load_dotenv
+from comet_llm import Span, end_chain, start_chain
 
 load_dotenv()
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
+MODEL = "gpt-3.5-turbo-0613"
 
 history = {}
 
@@ -49,6 +51,12 @@ def play(player, position):
         [3, 5, 7],
     ]
 
+    player1_plays = len(history.get("Bob", []))
+    player2_plays = len(history.get("Alice", []))
+
+    if player1_plays + player2_plays == 9:
+        return "The game is a draw."
+
     for combination in winning_combinations:
         if all(p in history[player] for p in combination):
             return f"Player {player} wins"
@@ -56,14 +64,14 @@ def play(player, position):
     return "Nobody wins"
 
 
-def get_completion(messages):
+def get_completion(messages, parameters):
     response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo-0613",
+        model=MODEL,
         messages=messages,
         functions=[
             {
                 "name": "play",
-                "description": "Call this function to indicate when a player played",
+                "description": "Call this function when a player plays",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -80,65 +88,26 @@ def get_completion(messages):
                 },
             },
         ],
-        temperature=0.1,
+        **parameters,
     )
 
     return response
 
 
-SYSTEM_PROMPT = """
-You will play a board game simulating two different players.
+def call_function(response, messages):
+    fn_name = response.choices[0].message["function_call"].name
+    args = response.choices[0].message["function_call"].arguments
+    arguments = json.loads(args)
 
-Here is how the game works:
-
-The board has 9 positions represented by a number from 1 to 9,
-eg. [1, 2, 3, 4, 5, 6, 7, 8, 9]. 
-
-Repeat these steps until the game is over:
-
-Step 1. You are the first player, named Bob.
-
-Step 2. Choose any of the available positions from the board. You can only
-pick one of the values in the current board. For example, if the board is
-[1, 2, 6, 7, 9], you can play any of the following positions: 1, 2, 6, 7 or 9.
-If the board is [3, 4, 5], you can play any of the following positions: 3, 4
-or 5. If there are no available positions, the game is over and you should
-write "The game is a draw."
-
-Step 3. Remove the position you played from the board. For example, if the
-board was [1, 2, 6, 7, 9] and you played in position 6, the new board will be
-[1, 2, 7, 9]. If the board was [3, 4, 5] and you played in position 5, the new
-board will be [3, 4].
-
-Step 4. Call the function play to add the position you played to the history.
-The function will return the name of the player who wins the game, or "Nobody
-wins" if the game is not over yet.
-
-Step 5. You are now the second player, named Alice. Repeat steps 2, 3, 4, and
-5. Continue the game until one of the two players wins the game.
-"""
-
-
-messages = [
-    {"role": "system", "content": SYSTEM_PROMPT},
-    {"role": "assistant", "content": "Board: [1, 2, 3, 4, 5, 6, 7, 8, 9]"},
-    {"role": "user", "content": "You play first"},
-]
-
-while True:
-    response = get_completion(messages)
-
-    if response.choices[0]["finish_reason"] == "stop":
-        print(response.choices[0].message["content"])
-        break
-
-    elif response.choices[0]["finish_reason"] == "function_call":
-        fn_name = response.choices[0].message["function_call"].name
-        args = response.choices[0].message["function_call"].arguments
-        arguments = json.loads(args)
-
-        result = locals()[fn_name](**arguments)
+    with Span(
+        category="llm-function-call",
+        name=fn_name,
+        inputs=arguments,
+    ) as span:
+        result = globals()[fn_name](**arguments)
         print_board()
+
+        span.set_outputs({"output": result})
 
         messages.append(
             {
@@ -158,3 +127,72 @@ while True:
                 "content": result,
             }
         )
+
+
+SYSTEM_PROMPT = """
+You will play a board game simulating two different players.
+
+Here is how the game works:
+
+The board has 9 positions represented by a number from 1 to 9,
+eg. [1, 2, 3, 4, 5, 6, 7, 8, 9]. 
+
+Repeat these steps until the game is over:
+
+Step 1. You are the first player, named Bob.
+
+Step 2. Choose any of the available positions from the board. You can only
+pick one of the values in the current board. For example, if the board is
+[1, 2, 6, 7, 9], you can play any of the following positions: 1, 2, 6, 7 or 9.
+If the board is [3, 4, 5], you can play any of the following positions: 3, 4
+or 5.
+
+Step 3. Remove the position you played from the board. For example, if the
+board was [1, 2, 6, 7, 9] and you played in position 6, the new board will be
+[1, 2, 7, 9]. If the board was [3, 4, 5] and you played in position 5, the new
+board will be [3, 4].
+
+Step 4. Call the function play to add the position you played to the history.
+The function will return the name of the player who wins the game, whether the
+game is a draw or "Nobody wins" if the game is not over yet.
+
+Step 5. You are now the second player, named Alice. Repeat steps 2, 3, 4, and
+5. Continue the game until one of the two players wins the game or the game is
+a draw.
+"""
+
+messages = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "assistant", "content": "Board: [1, 2, 3, 4, 5, 6, 7, 8, 9]"},
+    {"role": "user", "content": "You play first"},
+]
+
+parameters = {
+    "temperature": 0.1,
+}
+
+
+start_chain(
+    inputs={
+        "prompt": SYSTEM_PROMPT,
+    },
+    api_key=os.getenv("COMET_API_KEY"),
+)
+
+
+while True:
+    with Span(
+        category="llm-call",
+        name="llm-generation",
+        metadata={"model": MODEL, "parameters": parameters},
+        inputs=messages,
+    ) as span:
+        response = get_completion(messages, parameters)
+
+        if response.choices[0]["finish_reason"] == "stop":
+            print(response.choices[0].message["content"])
+            end_chain({"output": response.choices[0].message["content"]})
+            break
+
+        elif response.choices[0]["finish_reason"] == "function_call":
+            call_function(response, messages)
